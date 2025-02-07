@@ -6,6 +6,9 @@ from torch.optim.lr_scheduler import OneCycleLR
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
+import numpy as np
+from ranger21 import Ranger21
+from torch_ema import ExponentialMovingAverage
 
 from dataset import DatasetManager
 from model import create_model, get_hardware_info
@@ -21,7 +24,7 @@ def setup_environment():
     print("\n=== Preparing Datasets ===")
     prepare_all_datasets()
 
-def train_model(data_dir, num_epochs=30):
+def train_model(data_dir, num_epochs=50):  # Increased epochs for better convergence
     # Get hardware settings
     hw_info = get_hardware_info()
     device = hw_info['device']
@@ -38,17 +41,34 @@ def train_model(data_dir, num_epochs=30):
     train_loader, val_loader = dataset_manager.get_loaders()
     model = create_model(dataset_manager.get_num_classes(), device)
     
-    # Training setup
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-    scheduler = OneCycleLR(optimizer, max_lr=3e-3, epochs=num_epochs, steps_per_epoch=len(train_loader))
+    # Training setup with advanced optimization
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # Label smoothing
+    optimizer = Ranger21(
+        model.parameters(),
+        lr=1e-3,
+        num_epochs=num_epochs,
+        num_batches_per_epoch=len(train_loader),
+        warmup_pct=0.1,
+        decay_pct=0.8
+    )
+    
+    # EMA model for better stability
+    ema = ExponentialMovingAverage(model.parameters(), decay=0.995)
     scaler = GradScaler() if use_amp else None
     
     # Training history
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     best_val_acc = 0
+    patience = 10  # Early stopping patience
+    plateau_counter = 0
     
     for epoch in range(num_epochs):
+        # Progressive layer unfreezing
+        if hasattr(model, 'module'):
+            model.module.unfreeze_layers(epoch)
+        else:
+            model.unfreeze_layers(epoch)
+        
         # Training phase
         model.train()
         train_loss = train_correct = train_total = 0
@@ -64,6 +84,11 @@ def train_model(data_dir, num_epochs=30):
                 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -72,9 +97,11 @@ def train_model(data_dir, num_epochs=30):
                 
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
-            scheduler.step()
+            # Update EMA model
+            ema.update()
             
             # Calculate metrics
             train_loss += loss.item()
@@ -82,7 +109,9 @@ def train_model(data_dir, num_epochs=30):
             train_total += targets.size(0)
             train_correct += predicted.eq(targets).sum().item()
         
-        # Validation phase
+        # Validation phase with EMA model
+        ema.store()
+        ema.copy_to()
         model.eval()
         val_loss = val_correct = val_total = 0
         
@@ -96,6 +125,9 @@ def train_model(data_dir, num_epochs=30):
                 _, predicted = outputs.max(1)
                 val_total += targets.size(0)
                 val_correct += predicted.eq(targets).sum().item()
+        
+        # Restore original model
+        ema.restore()
         
         # Calculate epoch metrics
         train_loss = train_loss / len(train_loader)
@@ -114,15 +146,29 @@ def train_model(data_dir, num_epochs=30):
         print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%')
         
-        # Save best model
+        # Save best model and check early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            plateau_counter = 0
             os.makedirs('model', exist_ok=True)
+            
+            # Save EMA model instead of regular model
+            ema.store()
+            ema.copy_to()
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
+                'epoch': epoch,
             }, 'model/best_model.pth')
+            ema.restore()
+        else:
+            plateau_counter += 1
+            
+        # Early stopping check
+        if plateau_counter >= patience:
+            print(f"\nEarly stopping triggered after {patience} epochs without improvement")
+            break
     
     plot_training_history(history)
     return history, model
