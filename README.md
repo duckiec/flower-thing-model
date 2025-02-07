@@ -2,9 +2,6 @@
 
 Deep learning model for flower classification with automatic GPU optimization.
 
-Created by [duckiec](https://github.com/duckiec/flower-thing-model)
-
-## Quick Start
 
 ```bash
 # Clone the repository
